@@ -55,9 +55,13 @@ target_link_libraries(kv_proto
     gRPC::grpc++
 )
 
+# Storage library
+add_library(kv_storage src/storage/kv_store.cpp)
+target_include_directories(kv_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 add_executable(kv_server src/server/main.cpp)
-target_include_directories(kv_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/server)
-target_link_libraries(kv_server PRIVATE kv_proto)
+target_include_directories(kv_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kv_server PRIVATE kv_proto kv_storage)
 
 add_executable(kv_client src/client/main.cpp)
 target_link_libraries(kv_client PRIVATE kv_proto)
@@ -67,8 +71,8 @@ enable_testing()
 find_package(GTest CONFIG REQUIRED)
 
 add_executable(storage_test tests/storage_test.cpp)
-target_include_directories(storage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/server)
-target_link_libraries(storage_test PRIVATE kv_proto GTest::gtest GTest::gtest_main)
+target_include_directories(storage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(storage_test PRIVATE kv_proto kv_storage GTest::gtest GTest::gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(storage_test)

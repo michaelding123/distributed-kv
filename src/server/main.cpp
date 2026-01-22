@@ -9,7 +9,8 @@ int main(int argc, char** argv) {
   std::string addr = "0.0.0.0:50051";
   if (argc > 1) addr = argv[1];
 
-  KVServiceImpl service;
+  KVStore store;
+  KVServiceImpl service(store);
 
   grpc::ServerBuilder builder;
   builder.AddListeningPort(addr, grpc::InsecureServerCredentials());

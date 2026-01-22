@@ -1,10 +1,11 @@
 #include <gtest/gtest.h>
 
-#include "kv_service.h"
+#include "server/kv_service.h"
 
 class StorageTest : public ::testing::Test {
  protected:
-  KVServiceImpl service_;
+  KVStore store_;
+  KVServiceImpl service_{store_};
 
   // Helper to put a key-value pair
   kv::PutResponse Put(const std::string& key, const std::string& value) {
