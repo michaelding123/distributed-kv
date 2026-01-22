@@ -24,14 +24,15 @@ class KVServiceImpl final : public kv::KV::Service {
 
   grpc::Status Put(grpc::ServerContext*, const kv::PutRequest* req,
                    kv::PutResponse* resp) override {
-    uint64_t version = store_.Put(req->key(), req->value());
-    resp->set_version(version);
+    auto result = store_.Put(req->key(), req->value(), req->request_id());
+    resp->set_version(result.version);
     return grpc::Status::OK;
   }
 
   grpc::Status Delete(grpc::ServerContext*, const kv::DeleteRequest* req,
                       kv::DeleteResponse* resp) override {
-    resp->set_ok(store_.Delete(req->key()));
+    auto result = store_.Delete(req->key(), req->request_id());
+    resp->set_ok(result.ok);
     return grpc::Status::OK;
   }
 
