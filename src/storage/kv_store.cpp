@@ -1,5 +1,7 @@
 #include "kv_store.h"
 
+#include <mutex>
+
 std::optional<Entry> KVStore::Get(const std::string& key) {
   std::shared_lock lock(mu_);
   auto it = store_.find(key);
