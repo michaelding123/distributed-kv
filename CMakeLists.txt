@@ -56,12 +56,30 @@ target_link_libraries(kv_proto
 )
 
 # Storage library
-add_library(kv_storage src/storage/kv_store.cpp)
-target_include_directories(kv_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_library(kv_storage
+  src/storage/kv_store.cpp
+  src/storage/wal.cpp
+  src/storage/snapshot.cpp
+)
+target_include_directories(kv_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/storage ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Replication library
+add_library(kv_replication
+  src/replication/replicator.cpp
+)
+target_include_directories(kv_replication PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kv_replication PUBLIC kv_proto)
+
+# Service library
+add_library(kv_service
+  src/server/kv_service.cpp
+)
+target_include_directories(kv_service PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kv_service PUBLIC kv_proto kv_storage kv_replication)
 
 add_executable(kv_server src/server/main.cpp)
 target_include_directories(kv_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(kv_server PRIVATE kv_proto kv_storage)
+target_link_libraries(kv_server PRIVATE kv_service gRPC::grpc++_reflection)
 
 add_executable(kv_client src/client/main.cpp)
 target_link_libraries(kv_client PRIVATE kv_proto)
@@ -72,7 +90,7 @@ find_package(GTest CONFIG REQUIRED)
 
 add_executable(storage_test tests/storage_test.cpp)
 target_include_directories(storage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(storage_test PRIVATE kv_proto kv_storage GTest::gtest GTest::gtest_main)
+target_link_libraries(storage_test PRIVATE kv_service GTest::gtest GTest::gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(storage_test)

@@ -1,0 +1,470 @@
+================================================================================
+                        DISTRIBUTED-KV ARCHITECTURE
+================================================================================
+
+A distributed, replicated key-value store built with gRPC, featuring:
+  - Leader-follower replication for fault tolerance
+  - Write-ahead logging (WAL) for durability
+  - Snapshot-based compaction
+  - Idempotent operations
+  - gRPC reflection for easy debugging
+
+================================================================================
+PROJECT STRUCTURE
+================================================================================
+
+distributed-kv/
+├── proto/kv.proto                  # gRPC service definition
+├── src/
+│   ├── server/
+│   │   ├── main.cpp                # Server entry point
+│   │   ├── kv_service.h            # gRPC service interface
+│   │   └── kv_service.cpp          # gRPC service implementation
+│   ├── client/
+│   │   └── main.cpp                # CLI client
+│   ├── storage/
+│   │   ├── kv_store.h              # Storage interface
+│   │   ├── kv_store.cpp            # Storage implementation
+│   │   ├── wal.h                   # Write-ahead log interface
+│   │   ├── wal.cpp                 # Write-ahead log implementation
+│   │   ├── snapshot.h              # Snapshot interface
+│   │   └── snapshot.cpp            # Snapshot implementation
+│   └── replication/
+│       ├── replicator.h            # Leader->follower replication
+│       └── replicator.cpp          # Replication implementation
+├── tests/
+│   └── storage_test.cpp            # Unit tests
+├── CMakeLists.txt                  # Build configuration
+├── vcpkg.json                      # Dependencies
+└── .github/workflows/ci.yml        # CI pipeline
+
+================================================================================
+COMPONENT DETAILS
+================================================================================
+
+1. PROTO DEFINITION (proto/kv.proto)
+--------------------------------------------------------------------------------
+Defines the gRPC service contract using Protocol Buffers 3.
+
+Service: kv.KV
+
+  Client-facing RPCs:
+  - Get(GetRequest) -> GetResponse
+      Retrieves a value by key.
+      Returns: found (bool), value (string), version (uint64)
+
+  - Put(PutRequest) -> PutResponse
+      Stores or updates a key-value pair.
+      Accepts: key, value, request_id (for idempotency)
+      Returns: version (uint64)
+
+  - Delete(DeleteRequest) -> DeleteResponse
+      Removes a key from the store.
+      Accepts: key, request_id (for idempotency)
+      Returns: ok (bool) - true if key existed
+
+  - Compact(CompactRequest) -> CompactResponse
+      Triggers WAL compaction (snapshot + truncate).
+      Returns: ok (bool)
+
+  Replication RPC (internal, leader -> follower):
+  - Replicate(ReplicateRequest) -> ReplicateResponse
+      Replicates a write operation to a follower.
+      Accepts: op (PUT/DELETE), key, value, request_id, sequence
+      Returns: ok (bool), sequence (uint64)
+
+--------------------------------------------------------------------------------
+
+2. STORAGE LAYER (src/storage/)
+--------------------------------------------------------------------------------
+kv_store.h - Data structures and interface:
+
+  struct Entry {
+    string value;      // The stored value
+    uint64 version;    // Write count (0 = deleted/never existed)
+  };
+
+  struct PutResult {
+    uint64 version;    // Version after put
+    bool was_duplicate; // True if request_id was seen before
+  };
+
+  struct DeleteResult {
+    bool ok;           // True if key existed
+    bool was_duplicate; // True if request_id was seen before
+  };
+
+  class KVStore {
+    KVStore()                        // In-memory only (no persistence)
+    KVStore(wal_path)                // With WAL persistence + snapshot
+    Get(key) -> optional<Entry>
+    Put(key, value, request_id) -> PutResult
+    Delete(key, request_id) -> DeleteResult
+    Compact() -> bool                // Take snapshot, truncate WAL
+    Size() -> size_t                 // Number of live keys
+  };
+
+kv_store.cpp - Implementation:
+
+  Startup sequence:
+    1. Load snapshot if exists (kv.wal.snapshot)
+    2. Replay WAL entries on top of snapshot
+    3. Open WAL for new writes
+
+  Concurrency:
+    - Uses std::shared_mutex for reader-writer locking
+    - Get() takes shared_lock (multiple concurrent readers)
+    - Put()/Delete() take unique_lock (exclusive writer)
+
+  Idempotency:
+    - If request_id is provided and was seen before, return cached result
+    - This allows safe retries without double-applying writes
+
+--------------------------------------------------------------------------------
+
+2b. WRITE-AHEAD LOG (src/storage/wal.h, wal.cpp)
+--------------------------------------------------------------------------------
+Provides durability by logging operations before they're applied.
+
+WALEntryType:
+  - PUT = 1
+  - DELETE = 2
+
+Binary format per entry:
+  [1 byte]  type
+  [4 bytes] key length
+  [N bytes] key
+  [4 bytes] value length
+  [N bytes] value
+  [4 bytes] request_id length
+  [N bytes] request_id
+
+Class WAL:
+  - LogPut(key, value, request_id): Append PUT entry
+  - LogDelete(key, request_id): Append DELETE entry
+  - ReadAll(): Read all entries (for replay)
+  - Reset(): Truncate the WAL (after snapshotting)
+  - Sync(): Flush to disk
+
+--------------------------------------------------------------------------------
+
+2c. SNAPSHOT (src/storage/snapshot.h, snapshot.cpp)
+--------------------------------------------------------------------------------
+Provides point-in-time snapshots for faster recovery and WAL compaction.
+
+Binary format:
+  [4 bytes] magic number (0x4B56534E = "KVSN")
+  [4 bytes] number of entries
+  For each entry:
+    [4 bytes] key length
+    [N bytes] key
+    [4 bytes] value length
+    [N bytes] value
+    [8 bytes] version
+
+Class Snapshot (static methods):
+  - Save(path, data) -> bool: Write snapshot atomically (via temp file)
+  - Load(path, data) -> bool: Load snapshot into map
+  - Exists(path) -> bool: Check if snapshot file exists
+
+Compaction process:
+  1. KVStore::Compact() acquires exclusive lock
+  2. Writes current state to snapshot file
+  3. Truncates WAL
+  4. Future recovery loads snapshot + replays (empty) WAL
+
+--------------------------------------------------------------------------------
+
+3. REPLICATION (src/replication/)
+--------------------------------------------------------------------------------
+Implements leader-follower replication for fault tolerance.
+
+replicator.h/cpp - Leader's replication engine:
+
+  class Replicator {
+    Replicator(followers)            // List of follower addresses
+    ReplicatePut(key, value, request_id) -> bool
+    ReplicateDelete(key, request_id) -> bool
+    FollowerCount() -> size_t
+  };
+
+Replication protocol:
+  1. Leader receives Put/Delete from client
+  2. Leader applies to local store
+  3. Leader sends Replicate RPC to ALL followers in parallel
+  4. Leader waits for MAJORITY acknowledgment
+  5. Leader returns success to client
+
+Majority requirement:
+  - With N followers, need (N/2)+1 acks to succeed
+  - Tolerates (N-1)/2 follower failures
+  - Example: 2 followers need 2 acks (both must respond)
+
+Followers:
+  - Accept Replicate RPC from leader
+  - Apply operation to local store (with WAL)
+  - Return acknowledgment
+
+--------------------------------------------------------------------------------
+
+4. GRPC SERVICE (src/server/kv_service.h, kv_service.cpp)
+--------------------------------------------------------------------------------
+class KVServiceImpl : public kv::KV::Service
+
+Implements the gRPC service interface:
+
+  SetReplicator(replicator): Enable leader mode
+  IsLeader() -> bool: Check if this node is a leader
+
+  Get(): Read from local store (works on leader or follower)
+
+  Put():
+    1. Apply to local store
+    2. If leader and not duplicate: replicate to followers
+    3. Return version to client
+
+  Delete():
+    1. Apply to local store
+    2. If leader and not duplicate: replicate to followers
+    3. Return ok to client
+
+  Compact(): Trigger KVStore::Compact()
+
+  Replicate(): (Called on followers by leader)
+    Apply the replicated operation to local store
+
+--------------------------------------------------------------------------------
+
+5. SERVER (src/server/main.cpp)
+--------------------------------------------------------------------------------
+Entry point with support for standalone, leader, or follower modes.
+
+Usage:
+  ./kv_server [options]
+
+Options:
+  --addr ADDR       Listen address (default: 0.0.0.0:50051)
+  --wal PATH        WAL file path (default: kv.wal)
+  --role ROLE       Role: leader or follower (default: leader)
+  --peers ADDRS     Comma-separated follower addresses (leader only)
+  --help            Show help
+
+Examples:
+  # Standalone server (no replication)
+  ./kv_server
+
+  # Start follower 1
+  ./kv_server --addr 0.0.0.0:50052 --wal kv2.wal --role follower
+
+  # Start follower 2
+  ./kv_server --addr 0.0.0.0:50053 --wal kv3.wal --role follower
+
+  # Start leader with replication
+  ./kv_server --addr 0.0.0.0:50051 --wal kv1.wal --role leader \
+              --peers localhost:50052,localhost:50053
+
+Features:
+  - gRPC reflection enabled (use grpcurl without proto file)
+  - WAL persistence with snapshot recovery
+  - Leader-follower replication
+
+--------------------------------------------------------------------------------
+
+6. CLIENT (src/client/main.cpp)
+--------------------------------------------------------------------------------
+Interactive CLI client for the KV store.
+
+Usage:
+  ./kv_client [--server HOST:PORT] <command> [args...]
+
+Commands:
+  get <key>                      Get value for key
+  put <key> <value> [request_id] Store key-value pair
+  delete <key> [request_id]      Delete key
+  compact                        Compact WAL (snapshot + truncate)
+
+Options:
+  --server, -s HOST:PORT  Server address (default: localhost:50051)
+  --help, -h              Show help
+
+Examples:
+  ./kv_client put mykey myvalue
+  ./kv_client get mykey
+  ./kv_client delete mykey
+  ./kv_client -s localhost:50052 get mykey   # Query a follower
+  ./kv_client compact                         # Trigger compaction
+
+--------------------------------------------------------------------------------
+
+7. TESTS (tests/storage_test.cpp)
+--------------------------------------------------------------------------------
+Google Test suite for KVStore. Tests:
+
+Basic operations:
+  - PutGetRoundTrip, GetNonExistentKey, OverwriteSameKey
+  - VersionIncrementsOnEachPut, DeleteExistingKey, DeleteNonExistentKey
+  - PutAfterDelete, MultipleKeys
+
+Idempotency:
+  - PutIdempotency, PutDifferentRequestIds
+  - DeleteIdempotency, DeleteNonExistentIdempotency
+  - PutWithoutRequestId
+
+Run tests:
+  cd build && ctest
+
+--------------------------------------------------------------------------------
+
+8. BUILD SYSTEM (CMakeLists.txt)
+--------------------------------------------------------------------------------
+CMake configuration that:
+  1. Finds protobuf and gRPC via vcpkg
+  2. Generates C++ code from kv.proto using protoc
+  3. Creates libraries:
+     - kv_proto: Generated protobuf/gRPC code
+     - kv_storage: KVStore, WAL, Snapshot
+     - kv_replication: Replicator
+     - kv_service: gRPC service implementation
+  4. Creates executables:
+     - kv_server: Full server with replication support
+     - kv_client: CLI client
+     - storage_test: Unit tests
+
+--------------------------------------------------------------------------------
+
+9. DEPENDENCIES (vcpkg.json)
+--------------------------------------------------------------------------------
+  - grpc: RPC framework
+  - protobuf: Serialization
+  - gtest: Testing framework
+
+================================================================================
+DATA FLOW
+================================================================================
+
+Client Write (Leader):
+  1. Client sends Put/Delete to leader
+  2. Leader applies to local KVStore (logged to WAL)
+  3. Leader sends Replicate RPC to all followers in parallel
+  4. Each follower applies to its local store (logged to WAL)
+  5. Leader waits for majority acknowledgment
+  6. Leader returns success to client
+
+Client Read:
+  1. Client sends Get to any node (leader or follower)
+  2. Node reads from local KVStore
+  3. Node returns value to client
+  (Note: Followers may have slightly stale data)
+
+Server Restart:
+  1. Load snapshot if exists
+  2. Replay WAL entries on top of snapshot
+  3. Server ready to accept requests
+
+Compaction:
+  1. Client sends Compact request
+  2. Server takes snapshot of current state
+  3. Server truncates WAL
+  4. Future recovery is faster (snapshot + empty WAL)
+
+================================================================================
+REPLICATION MODEL
+================================================================================
+
+Architecture: Leader-Follower (Primary-Backup)
+
+  ┌────────┐     Put/Delete     ┌────────┐
+  │ Client │ ─────────────────► │ Leader │
+  └────────┘                    └────────┘
+                                     │
+                         Replicate   │   Replicate
+                        ┌────────────┼────────────┐
+                        ▼            ▼            ▼
+                   ┌──────────┐ ┌──────────┐ ┌──────────┐
+                   │Follower 1│ │Follower 2│ │Follower N│
+                   └──────────┘ └──────────┘ └──────────┘
+
+Consistency:
+  - Writes go to leader only
+  - Reads can go to any node
+  - Eventual consistency (followers may lag slightly)
+
+Fault Tolerance:
+  - With N followers, tolerates up to (N-1)/2 failures
+  - Requires majority ((N/2)+1) for write success
+
+Limitations:
+  - No automatic leader election (leader is configured)
+  - No automatic failover
+  - Existing data not synced when follower joins
+
+================================================================================
+CONCURRENCY MODEL
+================================================================================
+
+Per-node concurrency (shared_mutex):
+  - Multiple concurrent readers (Get operations)
+  - Single exclusive writer (Put/Delete operations)
+
+Cross-node:
+  - Replication is asynchronous (parallel to followers)
+  - Write returns after majority ack
+
+================================================================================
+PERSISTENCE
+================================================================================
+
+Write-Ahead Logging (WAL):
+  - Every write logged BEFORE being applied
+  - Guarantees durability on crash
+
+Snapshots:
+  - Point-in-time capture of entire state
+  - Enables WAL truncation (compaction)
+  - Atomic writes via temp file + rename
+
+Recovery:
+  1. Load snapshot (if exists)
+  2. Replay WAL entries
+  3. Ready to serve
+
+================================================================================
+LIMITATIONS
+================================================================================
+
+Current limitations:
+  - No automatic leader election or failover
+  - No data sync when new follower joins
+  - No sharding/partitioning (single key space)
+  - No authentication (InsecureServerCredentials)
+  - Unbounded idempotency cache (grows forever)
+  - No checksums in WAL/snapshot (can't detect corruption)
+
+================================================================================
+QUICK START
+================================================================================
+
+# Build
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+cmake --build build
+
+# Run standalone
+./build/kv_server &
+./build/kv_client put hello world
+./build/kv_client get hello
+
+# Run distributed (3 terminals)
+./build/kv_server --addr 0.0.0.0:50052 --wal kv2.wal --role follower
+./build/kv_server --addr 0.0.0.0:50053 --wal kv3.wal --role follower
+./build/kv_server --role leader --peers localhost:50052,localhost:50053
+
+# Test replication
+./build/kv_client put mykey myvalue
+./build/kv_client -s localhost:50052 get mykey  # Works!
+
+# Using grpcurl (reflection enabled)
+grpcurl -plaintext localhost:50051 list
+grpcurl -plaintext -d '{"key":"foo","value":"bar"}' localhost:50051 kv.KV/Put
+grpcurl -plaintext -d '{"key":"foo"}' localhost:50051 kv.KV/Get
+
+================================================================================

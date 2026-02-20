@@ -2,9 +2,14 @@ syntax = "proto3";
 package kv;
 
 service KV {
+  // Client-facing RPCs
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Compact(CompactRequest) returns (CompactResponse);
+
+  // Replication RPCs (leader -> follower)
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
 }
 
 message GetRequest { string key = 1; }
@@ -15,3 +20,26 @@ message PutResponse { uint64 version = 1; }
 
 message DeleteRequest { string key = 1; string request_id = 2; }
 message DeleteResponse { bool ok = 1; }
+
+message CompactRequest {}
+message CompactResponse { bool ok = 1; }
+
+// Replication messages
+enum OperationType {
+  OP_UNKNOWN = 0;
+  OP_PUT = 1;
+  OP_DELETE = 2;
+}
+
+message ReplicateRequest {
+  OperationType op = 1;
+  string key = 2;
+  string value = 3;        // For PUT
+  string request_id = 4;
+  uint64 sequence = 5;     // Monotonic sequence number for ordering
+}
+
+message ReplicateResponse {
+  bool ok = 1;
+  uint64 sequence = 2;     // Echo back the sequence for confirmation
+}
